@@ -339,6 +339,68 @@ class RoundRobinTokenChoiceTopKRouter(TokenChoiceTopKRouter):
         )
 
 
+class GroupBalancedTopKRouter(TokenChoiceTopKRouter):
+    """Top-k router that takes ``top_k / num_groups`` experts from each of
+    ``num_groups`` contiguous expert groups.
+
+    Expert parallelism places a contiguous block of ``num_experts / ep`` experts
+    on each EP rank. With ``num_groups`` equal to the EP degree, every EP rank
+    receives exactly ``top_k / num_groups`` routed pairs per token, whatever the
+    router scores are, so the EP all-to-all is balanced by construction.
+
+    Only the choice of experts changes: the biased scores are ranked per group
+    instead of globally, and the gating values, token counts and expert bias
+    work as in ``TokenChoiceTopKRouter``. The expert bias still balances
+    experts within a group but cannot move load between groups. The cost is a
+    routing constraint: a token cannot place more than ``top_k / num_groups``
+    of its experts in one group.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(TokenChoiceTopKRouter.Config):
+        num_groups: int
+        """Contiguous expert groups. Set it to the EP degree to make each group
+        one EP rank's experts."""
+
+    def __init__(self, config: Config):
+        super().__init__(config)
+        if (
+            config.num_groups < 1
+            or self.num_experts % config.num_groups
+            or self.top_k % config.num_groups
+        ):
+            raise ValueError(
+                f"num_groups ({config.num_groups}) must divide num_experts "
+                f"({self.num_experts}) and top_k ({self.top_k})."
+            )
+        self.num_groups = config.num_groups
+
+    def _select_experts(
+        self,
+        scores_TE: torch.Tensor,
+        expert_bias_E: torch.Tensor | None = None,
+        **router_kwargs,
+    ) -> torch.Tensor:
+        scores_for_choice_TE = (
+            scores_TE if expert_bias_E is None else scores_TE + expert_bias_E
+        )
+        num_tokens = scores_for_choice_TE.shape[0]
+        experts_per_group = self.num_experts // self.num_groups
+        # Top-(top_k / num_groups) within each group, as group-local indices.
+        local_expert_ids_TGk = torch.topk(
+            scores_for_choice_TE.view(num_tokens, self.num_groups, experts_per_group),
+            k=self.top_k // self.num_groups,
+            dim=-1,
+            sorted=False,
+        ).indices
+        group_offsets_G1 = (
+            torch.arange(self.num_groups, device=local_expert_ids_TGk.device)
+            .mul_(experts_per_group)
+            .view(self.num_groups, 1)
+        )
+        return (local_expert_ids_TGk + group_offsets_G1).reshape(num_tokens, self.top_k)
+
+
 class QuantileBalancedTopKRouter(TokenChoiceTopKRouter):
     """Top-k router that uses a biased Top-(k+1) cutoff during training."""
 

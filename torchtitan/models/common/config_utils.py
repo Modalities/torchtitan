@@ -34,6 +34,7 @@ from torchtitan.models.common.linear import (
     SharedExpertRowParallelLinear,
 )
 from torchtitan.models.common.moe import (
+    GroupBalancedTopKRouter,
     MicrobatchWiseLoadBalanceLoss,
     MoE,
     RoutedExperts,
@@ -349,9 +350,14 @@ def make_router_config(
     route_norm_epsilon: float = 1e-20,
     route_scale: float = 1.0,
     bias: bool = False,
+    num_groups: int | None = None,
 ) -> TokenChoiceTopKRouter.Config:
-    """Build a fully-specified TokenChoiceTopKRouter.Config."""
-    return TokenChoiceTopKRouter.Config(
+    """Build a fully-specified TokenChoiceTopKRouter.Config.
+
+    ``num_groups`` selects ``GroupBalancedTopKRouter``, which takes
+    ``top_k / num_groups`` experts from each contiguous expert group.
+    """
+    router_kwargs = dict(
         num_experts=num_experts,
         gate=HiMidLoLinear.Config(
             in_features=dim,
@@ -366,6 +372,9 @@ def make_router_config(
         route_norm_epsilon=route_norm_epsilon,
         route_scale=route_scale,
     )
+    if num_groups is None:
+        return TokenChoiceTopKRouter.Config(**router_kwargs)
+    return GroupBalancedTopKRouter.Config(**router_kwargs, num_groups=num_groups)
 
 
 def make_routed_experts_config(

@@ -34,6 +34,7 @@ from torchtitan.models.common.linear import (
     SharedExpertRowParallelLinear,
 )
 from torchtitan.models.common.moe import (
+    GroupBalancedTopKRouter,
     MicrobatchWiseLoadBalanceLoss,
     MoE,
     RoundRobinTokenChoiceTopKRouter,
@@ -148,6 +149,93 @@ class TestMoE(unittest.TestCase):
             topk_expert_ids_TK,
             torch.tensor([[0, 1], [2, 3], [0, 1], [2, 3]]),
         )
+
+    def _group_balanced_router(self, *, num_experts=8, top_k=4, num_groups=2):
+        router = GroupBalancedTopKRouter.Config(
+            num_experts=num_experts,
+            gate=HiMidLoLinear.Config(in_features=4, out_features=num_experts),
+            score_func=Sigmoid.Config(),
+            top_k=top_k,
+            num_groups=num_groups,
+        ).build()
+        with torch.no_grad():
+            router.gate.weight.normal_()
+        return router
+
+    def test_group_balanced_router_takes_top_k_per_group(self):
+        router = self._group_balanced_router()
+        # Global top-4 would be [0, 1, 2, 3] for token 0.
+        scores_TE = torch.tensor(
+            [
+                [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2],
+                [0.1, 0.2, 0.3, 0.4, 0.9, 0.8, 0.7, 0.6],
+            ]
+        )
+
+        expert_ids_TK = router._select_experts(scores_TE)
+
+        self.assertEqual(
+            [sorted(ids) for ids in expert_ids_TK.tolist()],
+            [[0, 1, 4, 5], [2, 3, 4, 5]],
+        )
+
+    def test_group_balanced_router_balances_groups_exactly(self):
+        torch.manual_seed(0)
+        router = self._group_balanced_router(num_experts=16, top_k=8, num_groups=4)
+
+        _, _, routing_map_TE = router(torch.randn(64, 4))
+
+        torch.testing.assert_close(
+            routing_map_TE.view(64, 4, 4).sum(dim=-1),
+            torch.full((64, 4), 2),
+        )
+
+    def test_group_balanced_router_bias_reorders_within_groups(self):
+        router = self._group_balanced_router()
+        scores_TE = torch.tensor([[0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2]])
+        expert_bias_E = torch.tensor([0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0])
+
+        expert_ids_TK = router._select_experts(scores_TE, expert_bias_E)
+
+        self.assertEqual(sorted(expert_ids_TK.tolist()[0]), [2, 3, 4, 5])
+
+    def test_group_balanced_router_with_one_group_matches_top_k(self):
+        torch.manual_seed(0)
+        scores_TE = torch.rand(16, 8)
+        top_k_router = TokenChoiceTopKRouter.Config(
+            num_experts=8,
+            gate=HiMidLoLinear.Config(in_features=4, out_features=8),
+            score_func=Sigmoid.Config(),
+            top_k=4,
+        ).build()
+
+        grouped_TK = self._group_balanced_router(num_groups=1)._select_experts(
+            scores_TE
+        )
+        plain_TK = top_k_router._select_experts(scores_TE)
+
+        torch.testing.assert_close(
+            grouped_TK.sort(dim=-1).values, plain_TK.sort(dim=-1).values
+        )
+
+    def test_group_balanced_router_rejects_indivisible_groups(self):
+        for num_groups in (0, 3):
+            with self.assertRaisesRegex(ValueError, "num_groups"):
+                self._group_balanced_router(num_groups=num_groups)
+
+    def test_make_router_config_selects_group_balanced_router(self):
+        kwargs = dict(
+            dim=4,
+            num_experts=8,
+            gate_param_init={"weight": nn.init.zeros_},
+            score_func=Sigmoid.Config(),
+            top_k=4,
+        )
+
+        self.assertIs(type(make_router_config(**kwargs)), TokenChoiceTopKRouter.Config)
+        config = make_router_config(**kwargs, num_groups=2)
+        self.assertIsInstance(config, GroupBalancedTopKRouter.Config)
+        self.assertEqual(config.num_groups, 2)
 
     def test_routed_experts_use_configured_activation(self):
         """Routed experts build and execute their configured binary activation."""
